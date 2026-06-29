@@ -88,6 +88,28 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+    public static void HideSplashScreen()
+    {
+        lock (_gate)
+        {
+            _splashHidden = true;
+            if (_closed || _latestPresentation is not { IsSplash: true } latest)
+            {
+                return;
+            }
+
+            var sequence = latest.Sequence + 1;
+            _latestPresentation = new Presentation(
+                CreateBlackFrame(latest.Width, latest.Height),
+                latest.Width,
+                latest.Height,
+                sequence,
+                GuestDrawKind.None,
+                IsSplash: false);
+            Console.Error.WriteLine("[LOADER][INFO] Vulkan VideoOut hid splash");
+        }
+    }
+
     public static void Submit(byte[] bgraFrame, uint width, uint height)
     {
         if (bgraFrame.Length != checked((int)(width * height * 4)))
@@ -166,6 +188,24 @@ internal static unsafe class VulkanVideoPresenter
             };
             _thread.Start();
         }
+    }
+
+    private static byte[] CreateBlackFrame(uint width, uint height)
+    {
+        if (width == 0 || height == 0 || width > 8192 || height > 8192)
+        {
+            width = 1;
+            height = 1;
+        }
+
+        var pixels = GC.AllocateUninitializedArray<byte>(checked((int)(width * height * 4)));
+        pixels.AsSpan().Clear();
+        for (var offset = 3; offset < pixels.Length; offset += 4)
+        {
+            pixels[offset] = 0xFF;
+        }
+
+        return pixels;
     }
 
     private static void Run()

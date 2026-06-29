@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Libs.VideoOut;
 using System.Buffers.Binary;
 
 namespace SharpEmu.Libs.SystemService;
@@ -83,6 +84,17 @@ public static class SystemServiceExports
         return ctx.Memory.TryWrite(infoAddress, info)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "Vo5V8KAwCmk",
+        ExportName = "sceSystemServiceHideSplashScreen",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceHideSplashScreen(CpuContext ctx)
+    {
+        VulkanVideoPresenter.HideSplashScreen();
+        return SetReturn(ctx, 0);
     }
 
     private static int SetReturn(CpuContext ctx, int result)
