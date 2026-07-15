@@ -1816,6 +1816,8 @@ public static class KernelMemoryCompatExports
     {
         var pathAddress = ctx[CpuRegister.Rdi];
         var flags = unchecked((int)ctx[CpuRegister.Rsi]);
+        // Not migratable to [GuestCString]: the local reader's TryReadCompat host-memory
+        // fallback recovers paths in loader-mapped regions that ctx.Memory cannot see.
         if (!TryReadNullTerminatedUtf8(ctx, pathAddress, MaxGuestStringLength, out var guestPath))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
