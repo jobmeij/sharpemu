@@ -10,6 +10,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using SharpEmu.Core.Cpu.Debugging;
 using SharpEmu.Core.Cpu;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
@@ -316,11 +317,15 @@ public sealed partial class DirectExecutionBackend
 		}
 		if (!isGuestWorker &&
 			!ActiveForcedGuestExit &&
-			ShouldForceGuestExitOnImportLoop(in importStubEntry, num7, num, value, value2) &&
-			TryForceGuestExitToHostStub(argPackPtr, num, num7, importStubEntry.Nid))
+			ShouldForceGuestExitOnImportLoop(in importStubEntry, num7, num, value, value2))
 		{
-			cpuContext[CpuRegister.Rax] = 1uL;
-			return 1uL;
+			// Break before the forced exit so the loop state is still live.
+			NotifyDebuggerStall(CpuStallKind.ImportLoop, in importStubEntry, num7, num, value, value2);
+			if (TryForceGuestExitToHostStub(argPackPtr, num, num7, importStubEntry.Nid))
+			{
+				cpuContext[CpuRegister.Rax] = 1uL;
+				return 1uL;
+			}
 		}
 		bool flag0 = importStubEntry.SuppressStrlenTrace;
 		bool flag = num7 >= 2156221920u && num7 <= 2156225024u;
@@ -1345,8 +1350,7 @@ public sealed partial class DirectExecutionBackend
 				out var blockContinuation,
 				out var hasBlockContinuation,
 				out var blockWakeKey,
-				out var blockResumeHandler,
-				out var blockWakeHandler,
+				out var blockWaiter,
 				out var blockDeadlineTimestamp);
 		if (consumedThreadBlock &&
 			TryYieldGuestThreadToHostStub(argPackPtr, dispatchIndex, returnRip, importStubEntry.Nid, blockReason))
@@ -1357,8 +1361,7 @@ public sealed partial class DirectExecutionBackend
 					GuestThreadExecution.CurrentGuestThreadHandle,
 					blockContinuation,
 					blockWakeKey,
-					blockResumeHandler,
-					blockWakeHandler,
+					blockWaiter,
 					blockDeadlineTimestamp);
 			}
 
@@ -1407,6 +1410,8 @@ public sealed partial class DirectExecutionBackend
 			"eE4Szl8sil8" or // sceKernelAprSubmitCommandBuffer
 			"qvMUCyyaCSI" or // sceKernelAprSubmitCommandBufferAndGetId
 			"Q2V+iqvjgC0" or // vsnprintf
+			"AV6ipCNa4Rw" or // strcasecmp
+			"viiwFMaNamA" or // strstr
 			"q1cHNfGycLI" or // scePadRead
 			"xk0AcarP3V4" or // scePadOpen
 			"yH17Q6NWtVg" or // sceUserServiceGetEvent
@@ -1433,6 +1438,9 @@ public sealed partial class DirectExecutionBackend
 		var expectedMutexTrylockBusy =
 			string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+		var expectedSemaphoreTrywaitAgain =
+			string.Equals(nid, "H2a+IN9TP0E", StringComparison.Ordinal) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN;
 		var expectedNetAcceptWouldBlock =
 			string.Equals(nid, "PIWqhn9oSxc", StringComparison.Ordinal) &&
 			resultValue == unchecked((int)0x80410123);
@@ -1446,6 +1454,7 @@ public sealed partial class DirectExecutionBackend
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
 			!expectedMutexTrylockBusy &&
+			!expectedSemaphoreTrywaitAgain &&
 			!expectedNetAcceptWouldBlock &&
 			!expectedUserServiceNoEvent &&
 			!expectedPrivacyInvalidParameter)
@@ -1568,6 +1577,8 @@ public sealed partial class DirectExecutionBackend
 			"WkkeywLJcgU" or // wcslen
 			"Ovb2dSJOAuE" or // strcmp
 			"aesyjrHVWy4" or // strncmp
+			"AV6ipCNa4Rw" or // strcasecmp
+			"viiwFMaNamA" or // strstr
 			"pNtJdE3x49E" or // wcscmp
 			"fV2xHER+bKE" or // wcscoll
 			"E8wCoUEbfzk" or // wcsncmp

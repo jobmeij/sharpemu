@@ -110,8 +110,18 @@ public static partial class KernelMemoryCompatExports
     private static readonly Dictionary<ulong, string> _mappedRegionNames = new();
     private static readonly Dictionary<string, string> _guestMounts = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> _tracedStatResults = new(StringComparer.Ordinal);
-    private static readonly HashSet<string> _negativeStatCache = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly ConcurrentDictionary<string, ulong> _aprFileSizeCache = new(StringComparer.OrdinalIgnoreCase);
+    // Both caches memoize host filesystem probe outcomes, so their key
+    // equivalence must match the host filesystem's: Windows resolves names
+    // case-insensitively, but Linux hosts are case-sensitive, and an
+    // ignore-case cache there aliases distinct paths — a cached miss for
+    // "/app0/DATA.BIN" keeps answering NOT_FOUND for "/app0/Data.bin" even
+    // though that file exists and a fresh probe would find it.
+    private static readonly StringComparer HostFsPathComparer =
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+    private static readonly StringComparison HostFsPathComparison =
+        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+    private static readonly HashSet<string> _negativeStatCache = new(HostFsPathComparer);
+    private static readonly ConcurrentDictionary<string, ulong> _aprFileSizeCache = new(HostFsPathComparer);
     private static long _nextFileDescriptor = 2;
 
     internal static int AllocateGuestFileDescriptor()
@@ -211,6 +221,21 @@ public static partial class KernelMemoryCompatExports
             _negativeStatCache.RemoveWhere(path =>
                 string.Equals(path, normalizedMountPoint, StringComparison.OrdinalIgnoreCase) ||
                 path.StartsWith(normalizedMountPoint + "/", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    /// <summary>Removes a guest mount registered by <see cref="RegisterGuestPathMount"/>.</summary>
+    public static bool UnregisterGuestPathMount(string guestMountPoint)
+    {
+        var normalizedMountPoint = NormalizeGuestStatCachePath(guestMountPoint);
+        if (normalizedMountPoint is null)
+        {
+            return false;
+        }
+
+        lock (_guestMountGate)
+        {
+            return _guestMounts.Remove(normalizedMountPoint);
         }
     }
 
@@ -1086,6 +1111,7 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        ctx[CpuRegister.Rax] = destination;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1966,6 +1992,12 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
+        if (KernelSocketCompatExports.TryCloseSocketFd(fd))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
         FileStream? stream;
         lock (_fdGate)
         {
@@ -2459,7 +2491,20 @@ public static partial class KernelMemoryCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
             }
 
-            if (!TryFindAvailableDirectMemorySpanLocked(searchStart, searchEnd, alignment, out var candidate, out var rangeAvailable))
+            bool foundSpan;
+            ulong candidate;
+            ulong rangeAvailable;
+            lock (_memoryGate)
+            {
+                foundSpan = TryFindAvailableDirectMemorySpanLocked(
+                    searchStart,
+                    searchEnd,
+                    alignment,
+                    out candidate,
+                    out rangeAvailable);
+            }
+
+            if (!foundSpan)
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
@@ -2782,12 +2827,51 @@ public static partial class KernelMemoryCompatExports
         LibraryName = "libKernel")]
     public static int KernelMapDirectMemory(CpuContext ctx)
     {
-        var inOutAddressPointer = ctx[CpuRegister.Rdi];
-        var length = ctx[CpuRegister.Rsi];
-        var protection = unchecked((int)ctx[CpuRegister.Rdx]);
-        var flags = ctx[CpuRegister.Rcx];
-        var directMemoryStart = ctx[CpuRegister.R8];
-        var alignment = ctx[CpuRegister.R9];
+        return MapDirectMemoryCore(
+            ctx,
+            inOutAddressPointer: ctx[CpuRegister.Rdi],
+            length: ctx[CpuRegister.Rsi],
+            protection: unchecked((int)ctx[CpuRegister.Rdx]),
+            flags: ctx[CpuRegister.Rcx],
+            directMemoryStart: ctx[CpuRegister.R8],
+            alignment: ctx[CpuRegister.R9]);
+    }
+
+    [SysAbiExport(
+        Nid = "BQQniolj9tQ",
+        ExportName = "sceKernelMapDirectMemory2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelMapDirectMemory2(CpuContext ctx)
+    {
+        // The "2" variant inserts a memoryType argument (rdx) ahead of v1's
+        // protection, shifting protection/flags/directMemoryStart down one
+        // register each and pushing alignment onto the stack (the 7th argument,
+        // at [rsp + 8], above the return address). The memoryType only selects
+        // cache/GPU access attributes, which this HLE does not model per
+        // mapping, so it is accepted but does not affect placement.
+        ulong alignment = 0;
+        _ = ctx.TryReadUInt64(ctx[CpuRegister.Rsp] + sizeof(ulong), out alignment);
+
+        return MapDirectMemoryCore(
+            ctx,
+            inOutAddressPointer: ctx[CpuRegister.Rdi],
+            length: ctx[CpuRegister.Rsi],
+            protection: unchecked((int)ctx[CpuRegister.Rcx]),
+            flags: ctx[CpuRegister.R8],
+            directMemoryStart: ctx[CpuRegister.R9],
+            alignment: alignment);
+    }
+
+    private static int MapDirectMemoryCore(
+        CpuContext ctx,
+        ulong inOutAddressPointer,
+        ulong length,
+        int protection,
+        ulong flags,
+        ulong directMemoryStart,
+        ulong alignment)
+    {
         if (ShouldTraceDirectMemory())
         {
             Console.Error.WriteLine(
@@ -4709,8 +4793,12 @@ public static partial class KernelMemoryCompatExports
             matchedHostRoot,
             NormalizeMountRelativePath(relativePath)));
         var rootWithSeparator = Path.TrimEndingDirectorySeparator(matchedHostRoot) + Path.DirectorySeparatorChar;
-        if (!string.Equals(candidate, matchedHostRoot, StringComparison.OrdinalIgnoreCase) &&
-            !candidate.StartsWith(rootWithSeparator, StringComparison.OrdinalIgnoreCase))
+        // Host-semantics comparison: an ignore-case check on a case-sensitive
+        // host would let a relative path escape into a sibling directory that
+        // differs from the mount root only by case (root ".../Save" vs
+        // sibling ".../save").
+        if (!string.Equals(candidate, matchedHostRoot, HostFsPathComparison) &&
+            !candidate.StartsWith(rootWithSeparator, HostFsPathComparison))
         {
             return false;
         }
@@ -5931,9 +6019,12 @@ public static partial class KernelMemoryCompatExports
             var gapEnd = Math.Min(allocation.Start, effectiveEnd);
             if (candidate < gapEnd)
             {
-                spanStart = candidate;
-                spanLength = gapEnd - candidate;
-                return true;
+                var candidateLength = gapEnd - candidate;
+                if (candidateLength > spanLength)
+                {
+                    spanStart = candidate;
+                    spanLength = candidateLength;
+                }
             }
 
             if (allocation.Start >= effectiveEnd)
@@ -5944,12 +6035,20 @@ public static partial class KernelMemoryCompatExports
             candidate = AlignUp(Math.Max(candidate, allocationEnd), alignment);
             if (candidate >= effectiveEnd)
             {
-                return false;
+                break;
             }
         }
 
-        spanStart = candidate;
-        spanLength = effectiveEnd - candidate;
+        if (candidate < effectiveEnd)
+        {
+            var candidateLength = effectiveEnd - candidate;
+            if (candidateLength > spanLength)
+            {
+                spanStart = candidate;
+                spanLength = candidateLength;
+            }
+        }
+
         return spanLength != 0;
     }
 
@@ -5972,7 +6071,7 @@ public static partial class KernelMemoryCompatExports
         return highWaterMark;
     }
 
-    private static bool TryReadHostMemory(ulong address, Span<byte> destination)
+    private static unsafe bool TryReadHostMemory(ulong address, Span<byte> destination)
     {
         if (destination.IsEmpty || !IsHostRangeAccessible(address, (ulong)destination.Length, writeAccess: false))
         {
@@ -5981,9 +6080,7 @@ public static partial class KernelMemoryCompatExports
 
         try
         {
-            var temporary = new byte[destination.Length];
-            Marshal.Copy((nint)address, temporary, 0, temporary.Length);
-            temporary.AsSpan().CopyTo(destination);
+            new ReadOnlySpan<byte>((void*)address, destination.Length).CopyTo(destination);
             return true;
         }
         catch
@@ -6021,6 +6118,41 @@ public static partial class KernelMemoryCompatExports
         }
 
         return false;
+    }
+
+    internal static bool TryReadShaderGuestMemory(
+        ulong address,
+        Span<byte> destination)
+    {
+        if (destination.IsEmpty)
+        {
+            return true;
+        }
+
+        if (TryReadTrackedLibcHeap(address, destination))
+        {
+            return true;
+        }
+
+        var length = (ulong)destination.Length;
+        lock (_memoryGate)
+        {
+            if (TryFindVirtualQueryRegionLocked(
+                    address,
+                    findNext: false,
+                    out var region) &&
+                length <= region.Length &&
+                address >= region.Address &&
+                length <= region.Address + region.Length - address)
+            {
+                return TryReadHostMemory(address, destination);
+            }
+        }
+
+        // Direct execution uses guest virtual addresses as host virtual addresses.
+        // Some native mmap paths predate _mappedRegions tracking, so retain the same
+        // committed/readable-page fallback used by the libc compatibility layer.
+        return TryReadHostMemory(address, destination);
     }
 
     internal static bool TryReadTrackedLibcHeapGpuAlias(
@@ -6302,7 +6434,7 @@ public static partial class KernelMemoryCompatExports
         return value != 0 && (value & (value - 1)) == 0;
     }
 
-    private static bool TryWriteHostMemory(ulong address, ReadOnlySpan<byte> source)
+    private static unsafe bool TryWriteHostMemory(ulong address, ReadOnlySpan<byte> source)
     {
         if (source.IsEmpty || !IsHostRangeAccessible(address, (ulong)source.Length, writeAccess: true))
         {
@@ -6311,8 +6443,7 @@ public static partial class KernelMemoryCompatExports
 
         try
         {
-            var temporary = source.ToArray();
-            Marshal.Copy(temporary, 0, (nint)address, temporary.Length);
+            source.CopyTo(new Span<byte>((void*)address, source.Length));
             return true;
         }
         catch
@@ -6339,20 +6470,37 @@ public static partial class KernelMemoryCompatExports
             return false;
         }
 
-        if (!TryQueryHostPage(address, out var startInfo) || !HasRequiredProtection(startInfo.Protect, writeAccess))
-        {
-            return false;
-        }
-
         var endAddress = address + length - 1;
-        if (endAddress == address)
+        var currentAddress = address;
+        while (currentAddress <= endAddress)
         {
-            return true;
-        }
+            if (!TryQueryHostPage(currentAddress, out var info) ||
+                !HasRequiredProtection(info.Protect, writeAccess))
+            {
+                return false;
+            }
 
-        if (!TryQueryHostPage(endAddress, out var endInfo) || !HasRequiredProtection(endInfo.Protect, writeAccess))
-        {
-            return false;
+            var regionBase = unchecked((ulong)info.BaseAddress);
+            var regionSize = (ulong)info.RegionSize;
+            if (regionSize == 0 ||
+                regionBase > currentAddress ||
+                ulong.MaxValue - regionBase < regionSize)
+            {
+                return false;
+            }
+
+            var regionEnd = regionBase + regionSize;
+            if (regionEnd <= currentAddress)
+            {
+                return false;
+            }
+
+            if (regionEnd > endAddress)
+            {
+                return true;
+            }
+
+            currentAddress = regionEnd;
         }
 
         return true;

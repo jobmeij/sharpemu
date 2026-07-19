@@ -140,6 +140,13 @@ public static class KernelPthreadCompatExports
     }
 
     [SysAbiExport(
+        Nid = "B5GmVDKwpn0",
+        ExportName = "pthread_yield",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixPthreadYield(CpuContext ctx) => PthreadYield(ctx);
+
+    [SysAbiExport(
         Nid = "GBUY7ywdULE",
         ExportName = "scePthreadRename",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -676,10 +683,15 @@ public static class KernelPthreadCompatExports
                         return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
                     }
 
-                    // FreeBSD maps NORMAL to checked non-recursive behavior:
-                    // self-lock is an error, never implicit recursion.
-                    TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK);
-                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
+                    // Several Gen5 runtimes layer their own owner/count bookkeeping
+                    // over a NORMAL or ADAPTIVE kernel mutex. Returning EDEADLK here
+                    // leaves that guest bookkeeping out of sync with the HLE owner and
+                    // turns the wrapper into a permanent lock/unlock retry loop. Keep
+                    // the compatibility recursion used by the original implementation;
+                    // ERRORCHECK mutexes still take the strict EDEADLK path below.
+                    state.RecursionCount++;
+                    TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 }
                 else
                 {
@@ -691,7 +703,14 @@ public static class KernelPthreadCompatExports
                 }
             }
 
-            if (state.OwnerThreadId == 0 && state.Waiters.Count == 0)
+            // pthread_mutex_trylock succeeds whenever the mutex is not currently
+            // held; unlike the blocking lock it does not queue behind waiters
+            // (POSIX gives it no fairness obligation). Gating trylock on an empty
+            // wait queue is wrong and, worse, lets a single stale/undrainable
+            // waiter wedge a spin-on-trylock loop forever even though the mutex
+            // is free (owner==0). The blocking lock still honours FIFO so real
+            // blocked waiters are not starved by a barging locker.
+            if (state.OwnerThreadId == 0 && (tryOnly || state.Waiters.Count == 0))
             {
                 state.OwnerThreadId = currentThreadId;
                 state.RecursionCount = 1;
@@ -1229,7 +1248,21 @@ public static class KernelPthreadCompatExports
         var currentThreadId = KernelPthreadState.GetCurrentThreadHandle();
         lock (mutexState)
         {
-            if (mutexState.OwnerThreadId != currentThreadId || mutexState.RecursionCount != 1)
+            if (mutexState.OwnerThreadId == 0 && mutexState.RecursionCount == 0)
+            {
+                // The guest holds the mutex through a path our host-side tracking
+                // never observed — most commonly libkernel's uncontended userspace
+                // fast-path, which locks the mutex word directly without an HLE
+                // call. Real pthread_cond_wait requires the caller to own the
+                // mutex and does not verify it for normal mutexes, so returning
+                // EPERM here is wrong: it spins the guest and, worse, leaves the
+                // mutex held (the unlock below is skipped), wedging every thread
+                // that later blocks on pthread_mutex_lock. Adopt ownership so the
+                // unlock/wait/re-lock cycle is balanced and releases the mutex.
+                mutexState.OwnerThreadId = currentThreadId;
+                mutexState.RecursionCount = 1;
+            }
+            else if (mutexState.OwnerThreadId != currentThreadId || mutexState.RecursionCount != 1)
             {
                 return mutexState.OwnerThreadId == currentThreadId
                     ? (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT
@@ -1380,6 +1413,31 @@ public static class KernelPthreadCompatExports
         bool cooperative,
         string? wakeKey = null)
     {
+        // A guest thread can have at most one pending acquisition on a mutex —
+        // it is either running or blocked on exactly one wait. If a waiter for
+        // this thread is still queued when it comes back for a fresh
+        // acquisition, that entry is a stale leftover the thread abandoned
+        // (most often a cond_timedwait timeout whose re-acquire hand-off was
+        // lost). Stale entries clog the FIFO head with waiters no thread is
+        // blocked on, so the unlock hand-off wakes a dead wake-key and the
+        // mutex wedges permanently (observed deadlocking Hades: several
+        // re-acquire waiters from one thread piled ahead of a live locker).
+        // Prune any prior entry for this thread before enqueueing the new one.
+        if (threadId != 0)
+        {
+            for (var node = state.Waiters.First; node is not null;)
+            {
+                var next = node.Next;
+                if (node.Value.ThreadId == threadId)
+                {
+                    state.Waiters.Remove(node);
+                    node.Value.Node = null;
+                }
+
+                node = next;
+            }
+        }
+
         var waiter = new PthreadMutexWaiter
         {
             ThreadId = threadId,

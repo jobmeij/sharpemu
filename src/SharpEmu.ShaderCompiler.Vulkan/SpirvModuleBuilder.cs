@@ -238,6 +238,7 @@ public enum SpirvDecoration : uint
     Binding = 33,
     DescriptorSet = 34,
     Offset = 35,
+    NoContraction = 42,
 }
 
 public enum SpirvBuiltIn : uint
@@ -251,6 +252,7 @@ public enum SpirvBuiltIn : uint
     LocalInvocationId = 27,
     GlobalInvocationId = 28,
     LocalInvocationIndex = 29,
+    SubgroupSize = 36,
     SubgroupLocalInvocationId = 41,
 }
 
