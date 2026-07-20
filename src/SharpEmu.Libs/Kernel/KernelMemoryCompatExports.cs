@@ -1,4 +1,4 @@
-// Copyright (C) 2026 SharpEmu Emulator Project
+﻿// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
@@ -65,7 +65,10 @@ public static partial class KernelMemoryCompatExports
     private const uint HostPageExecuteReadWrite = 0x40;
     private const uint HostPageExecuteWriteCopy = 0x80;
     private const uint HostPageGuard = 0x100;
+    private const int Enoent = 2;
+    private const int Ebadf = 9;
     private const int Enomem = 12;
+    private const int Eacces = 13;
     private const int Efault = 14;
     private const int Einval = 22;
     private const int Erange = 34;
@@ -1105,10 +1108,13 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var payload = GC.AllocateUninitializedArray<byte>(count);
-        if (count > 0 && (!TryReadCompat(ctx, source, payload) || !TryWriteCompat(ctx, destination, payload)))
+        if (count > 0 && !ctx.Memory.TryCopy(destination, source, (ulong)count))
         {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            var payload = GC.AllocateUninitializedArray<byte>(count);
+            if (!TryReadCompat(ctx, source, payload) || !TryWriteCompat(ctx, destination, payload))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
         }
 
         ctx[CpuRegister.Rax] = destination;
@@ -1542,7 +1548,13 @@ public static partial class KernelMemoryCompatExports
         ExportName = "close",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PosixClose(CpuContext ctx) => KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi]));
+    public static int PosixClose(CpuContext ctx)
+    {
+        var result = KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi]));
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : PosixFailure(ctx, result, notFoundErrno: Ebadf);
+    }
 
     [SysAbiExport(
         Nid = "UK2Tl2DWUns",
@@ -1599,6 +1611,29 @@ public static partial class KernelMemoryCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // Translates a failed raw Orbis kernel result into the libc/POSIX ABI:
+    // return -1 with errno set. The raw sceKernel* implementations report the
+    // 0x8002xxxx sentinel through the return value, but the POSIX-named exports
+    // (open/fstat/close/read/write/stat) are called by libc code that expects a
+    // negative result on failure. Leaking the raw sentinel makes callers store
+    // it as a "valid" fd or handle and later dereference it - the null-pointer
+    // access violation seen when Unity's IL2CPP file layer probes an absent
+    // il2cpp.usym. fd-based calls pass notFoundErrno=Ebadf; path-based calls
+    // leave the Enoent default.
+    private static int PosixFailure(CpuContext ctx, int orbisResult, int notFoundErrno = Enoent)
+    {
+        var errno = orbisResult switch
+        {
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT => Einval,
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT => Efault,
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED => Eacces,
+            _ => notFoundErrno,
+        };
+        KernelRuntimeCompatExports.TrySetErrno(ctx, errno);
+        ctx[CpuRegister.Rax] = ulong.MaxValue;
+        return -1;
+    }
+
     [SysAbiExport(
         Nid = "E6ao34wPw+U",
         ExportName = "stat",
@@ -1607,23 +1642,29 @@ public static partial class KernelMemoryCompatExports
     public static int PosixStat(CpuContext ctx)
     {
         var result = KernelStat(ctx);
-        if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
-        {
-            return 0;
-        }
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : PosixFailure(ctx, result);
+    }
 
-        // stat(2) follows the libc/POSIX ABI: failures return -1 and expose
-        // the reason through errno. Returning the raw Orbis kernel code here
-        // makes callers treat a missing file as a non-negative success value.
-        var errno = result switch
-        {
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT => Einval,
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT => Efault,
-            _ => 2, // ENOENT
-        };
-        KernelRuntimeCompatExports.TrySetErrno(ctx, errno);
-        ctx[CpuRegister.Rax] = ulong.MaxValue;
-        return -1;
+    // POSIX open(2): translates a failed raw open into -1/errno. On success
+    // KernelOpenUnderscore already writes the fd into RAX (the import bridge
+    // prefers a written RAX over the return value), so returning 0 is correct.
+    public static int PosixOpen(CpuContext ctx)
+    {
+        var result = KernelOpenUnderscore(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : PosixFailure(ctx, result);
+    }
+
+    // POSIX fstat(2): a bad fd maps to EBADF rather than the path-oriented ENOENT.
+    public static int PosixFstat(CpuContext ctx)
+    {
+        var result = KernelFstat(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : PosixFailure(ctx, result, notFoundErrno: Ebadf);
     }
 
     [SysAbiExport(
@@ -1637,6 +1678,7 @@ public static partial class KernelMemoryCompatExports
         var count = ctx[CpuRegister.Rsi];
         var idsAddress = ctx[CpuRegister.Rdx];
         var sizesAddress = ctx[CpuRegister.Rcx];
+        var errorIndexAddress = ctx[CpuRegister.R8];
         if (pathListAddress == 0 || count == 0 || sizesAddress == 0 || count > 1024)
         {
             KernelRuntimeCompatExports.TrySetErrno(ctx, Einval);
@@ -1661,12 +1703,8 @@ public static partial class KernelMemoryCompatExports
             var hostPath = ResolveGuestPath(guestPath);
             if (!TryGetAprFileSize(hostPath, out var fileSize))
             {
-                // Per-file resolve: a missing entry gets an invalid id
-                // (0xFFFFFFFF, already written above) and size 0, and the batch
-                // CONTINUES. Aborting the whole batch on the first miss left the
-                // remaining paths unresolved and could stall the guest's asset
-                // streaming when a batch happens to include an absent (e.g.
-                // patch/DLC) file; the caller checks per-file id/size.
+                // Stop at the first miss and report its index.
+                // The caller can then use its normal file-open fallback.
                 LogIoTrace("apr_resolve", guestPath, $"host='{hostPath}' index={i} count={count} result=not_found");
                 if (sizesAddress != 0 &&
                     !TryWriteUInt64Compat(ctx, sizesAddress + (i * sizeof(ulong)), 0))
@@ -1675,7 +1713,16 @@ public static partial class KernelMemoryCompatExports
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
                 }
 
-                continue;
+                if (errorIndexAddress != 0 &&
+                    !TryWriteUInt32Compat(ctx, errorIndexAddress, (uint)i))
+                {
+                    KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+
+                KernelRuntimeCompatExports.TrySetErrno(ctx, 2); // ENOENT
+                ctx[CpuRegister.Rax] = ulong.MaxValue;
+                return -1;
             }
 
             var fileId = AmprFileRegistry.Register(guestPath, hostPath);
@@ -2093,7 +2140,15 @@ public static partial class KernelMemoryCompatExports
         ExportName = "read",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PosixRead(CpuContext ctx) => KernelReadUnderscore(ctx);
+    public static int PosixRead(CpuContext ctx)
+    {
+        // On success KernelReadUnderscore writes the byte count into RAX, which
+        // the import bridge prefers over this return value.
+        var result = KernelReadUnderscore(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : PosixFailure(ctx, result, notFoundErrno: Ebadf);
+    }
 
     [SysAbiExport(
         Nid = "Cg4srZ6TKbU",
@@ -2292,7 +2347,15 @@ public static partial class KernelMemoryCompatExports
         ExportName = "write",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PosixWrite(CpuContext ctx) => KernelWriteUnderscore(ctx);
+    public static int PosixWrite(CpuContext ctx)
+    {
+        // On success KernelWriteUnderscore writes the byte count into RAX, which
+        // the import bridge prefers over this return value.
+        var result = KernelWriteUnderscore(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : PosixFailure(ctx, result, notFoundErrno: Ebadf);
+    }
 
     [SysAbiExport(
         Nid = "4wSze92BhLI",
@@ -2319,6 +2382,37 @@ public static partial class KernelMemoryCompatExports
         var nanoseconds = (now.Ticks % TimeSpan.TicksPerSecond) * 100;
         if (!ctx.TryWriteUInt64(timespecAddress, unchecked((ulong)seconds)) ||
             !ctx.TryWriteUInt64(timespecAddress + sizeof(long), unchecked((ulong)nanoseconds)))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "smIj7eqzZE8",
+        ExportName = "clock_getres",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int ClockGetres(CpuContext ctx)
+    {
+        var timespecAddress = ctx[CpuRegister.Rsi];
+
+        // POSIX allows a null resolution pointer: the call then only validates
+        // the clock id, which every id a title passes here does.
+        if (timespecAddress == 0)
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        // clock_gettime above is backed by DateTimeOffset.UtcNow, whose tick is
+        // 100 ns, so that is the honest resolution to report rather than the 1 ns
+        // a caller might otherwise assume it can rely on.
+        const ulong ResolutionNanoseconds = 100;
+        if (!ctx.TryWriteUInt64(timespecAddress, 0) ||
+            !ctx.TryWriteUInt64(timespecAddress + sizeof(long), ResolutionNanoseconds))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
@@ -2984,6 +3078,7 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        GuestWriteWatch.OnDirectMapping(mappedAddress, length, protection);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -3416,6 +3511,48 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+
+    }
+
+    /// <summary>
+    /// POSIX alias of <see cref="KernelMprotect"/>; identical (addr, len, prot)
+    /// argument order. Imported by libcohtml, whose embedded V8 changes page
+    /// permissions through this name when moving JIT pages between writable and
+    /// executable.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "YQOfxL4QfeU",
+        ExportName = "mprotect",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixMprotect(CpuContext ctx) => KernelMprotect(ctx);
+
+    /// <summary>
+    /// POSIX alias of <see cref="KernelMunmap"/>; identical (addr, len) argument
+    /// order.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "UqDGjXA5yUM",
+        ExportName = "munmap",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixMunmap(CpuContext ctx) => KernelMunmap(ctx);
+
+    /// <summary>
+    /// Reports the 16 KiB page granularity this backend maps and aligns against
+    /// (<see cref="OrbisPageSize"/>), not the host's 4 KiB. An allocator that
+    /// rounded to the host value would hand back sub-page offsets that every
+    /// mapping call here then rejects for misalignment.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "k+AXqu2-eBc",
+        ExportName = "getpagesize",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixGetPageSize(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = OrbisPageSize;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -4549,7 +4686,8 @@ public static partial class KernelMemoryCompatExports
             allowSearch: false,
             allowAllocateAtAlternative: false,
             "reserve fixed range",
-            out _);
+            out _,
+            backPartialOverlap: true);
     }
 
     internal static bool IsGuestRangeBacked(CpuContext ctx, ulong address, ulong length)
@@ -4750,7 +4888,7 @@ public static partial class KernelMemoryCompatExports
                 !guestPath.StartsWith("/", StringComparison.Ordinal) &&
                 !guestPath.StartsWith("\\", StringComparison.Ordinal))
             {
-                var relative = guestPath.Replace('/', Path.DirectorySeparatorChar);
+                var relative = NormalizeMountRelativePath(guestPath);
                 return Path.Combine(app0Root, relative);
             }
         }
@@ -4825,12 +4963,40 @@ public static partial class KernelMemoryCompatExports
         return _cachedApp0Root;
     }
 
+    // Resolves "." and ".." inside a mount-relative guest path and clamps the
+    // result at the mount root, so a guest path can never escape into the host
+    // filesystem. Unreal Engine titles depend on this: their base directory is
+    // <app>/binaries/<platform>, so they address content with "../../../"
+    // prefixes that land back inside /app0 on real hardware. Combining those
+    // raw against the app0 root walked out of the game folder entirely, so the
+    // title enumerated an unrelated host directory and never found its .pak files.
     private static string NormalizeMountRelativePath(string relativePath)
     {
-        return relativePath
-            .TrimStart('/', '\\')
-            .Replace('/', Path.DirectorySeparatorChar)
-            .Replace('\\', Path.DirectorySeparatorChar);
+        var segments = relativePath.Split(
+            new[] { '/', '\\' },
+            StringSplitOptions.RemoveEmptyEntries);
+        var resolved = new List<string>(segments.Length);
+        foreach (var segment in segments)
+        {
+            if (segment == ".")
+            {
+                continue;
+            }
+
+            if (segment == "..")
+            {
+                if (resolved.Count > 0)
+                {
+                    resolved.RemoveAt(resolved.Count - 1);
+                }
+
+                continue;
+            }
+
+            resolved.Add(segment);
+        }
+
+        return string.Join(Path.DirectorySeparatorChar, resolved);
     }
 
     private static string ResolveDevlogAppRoot()
@@ -5651,6 +5817,74 @@ public static partial class KernelMemoryCompatExports
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Inserts <paramref name="replacement"/> into the tracked-region table,
+    /// carving it out of any regions it overlaps and preserving the parts of
+    /// those regions that fall outside it.
+    /// </summary>
+    /// <remarks>
+    /// The table is a SortedList keyed by start address, so assigning directly
+    /// destroys any existing entry that happens to share a start address. That
+    /// silently discarded enclosing reservations: a title reserves a large range
+    /// and then commits a small mapping at the same base, and the record of
+    /// everything past the small mapping disappears — leaving sceKernelVirtualQuery
+    /// unable to find memory the guest legitimately owns.
+    ///
+    /// Carving also keeps the table non-overlapping. Previously a new region
+    /// starting inside an existing one produced two overlapping entries, which
+    /// the ordered scan in TryFindVirtualQueryRegionLocked is not written to
+    /// expect.
+    /// </remarks>
+    private static void ReplaceMappedRegionRangeLocked(MappedRegion replacement)
+    {
+        if (replacement.Length == 0 ||
+            !TryAddU64(replacement.Address, replacement.Length, out var replacementEnd))
+        {
+            _mappedRegions[replacement.Address] = replacement;
+            return;
+        }
+
+        var start = replacement.Address;
+        List<MappedRegion>? overlapping = null;
+        foreach (var region in _mappedRegions.Values)
+        {
+            if (region.Length == 0 ||
+                !TryAddU64(region.Address, region.Length, out var regionEnd))
+            {
+                continue;
+            }
+
+            if (region.Address < replacementEnd && regionEnd > start)
+            {
+                (overlapping ??= []).Add(region);
+            }
+        }
+
+        if (overlapping is not null)
+        {
+            foreach (var region in overlapping)
+            {
+                _mappedRegions.Remove(region.Address);
+            }
+
+            foreach (var region in overlapping)
+            {
+                var regionEnd = region.Address + region.Length;
+                if (region.Address < start)
+                {
+                    AddMappedRegionSliceLocked(region, region.Address, start, region.Protection);
+                }
+
+                if (regionEnd > replacementEnd)
+                {
+                    AddMappedRegionSliceLocked(region, replacementEnd, regionEnd, region.Protection);
+                }
+            }
+        }
+
+        _mappedRegions[start] = replacement;
     }
 
     private static void AddMappedRegionSliceLocked(
